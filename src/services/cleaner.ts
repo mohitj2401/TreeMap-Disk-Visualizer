@@ -72,11 +72,29 @@ function commandError(err: Error & { killed?: boolean; signal?: NodeJS.Signals |
 /** Runs one command to its end; rejects with what it wrote to stderr. */
 export function runCommand({ cmd, args, env: extraEnv }: PlatformCommand, timeoutMs = 15000): Promise<void> {
   const env = extraEnv ? { ...process.env, ...extraEnv } : undefined;
+  const isExplorer = cmd === 'explorer.exe';
+  const effectiveArgs = isExplorer && args.length === 2 && args[0] === '/select,'
+    ? (() => {
+        const norm = path.win32 ? path.win32.normalize(args[1]) : args[1];
+        const target = norm.length > 3 && (norm.endsWith('\\') || norm.endsWith('/')) ? norm.replace(/[\\/]+$/, '') : norm;
+        return [`/select,"${target}"`];
+      })()
+    : args;
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, ...(env ? { env } : {}) }, (err, _stdout, stderr) => {
-      if (err) reject(commandError(err, stderr));
-      else resolve();
-    });
+    execFile(
+      cmd,
+      effectiveArgs,
+      {
+        timeout: timeoutMs,
+        windowsHide: !isExplorer,
+        ...(isExplorer ? { windowsVerbatimArguments: true } : {}),
+        ...(env ? { env } : {}),
+      },
+      (err, _stdout, stderr) => {
+        if (err) reject(commandError(err, stderr));
+        else resolve();
+      }
+    );
   });
 }
 
@@ -477,6 +495,27 @@ export function openCommand(p: string, reveal: boolean, platform: NodeJS.Platfor
 export async function openPath(p: string, reveal = false, scope: OpenScope = 'scanned'): Promise<void> {
   assertMayOpen(p, scope);
   await fsp.lstat(p); // throws ENOENT for missing paths
+
+  if (openStep === runCommand && typeof process !== 'undefined' && process.versions?.electron) {
+    try {
+      // In Electron runtime, use the native shell API which reliably reveals and focuses Explorer/Finder
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const electron = require('electron') as typeof import('electron') | undefined;
+      if (electron?.shell) {
+        if (reveal) {
+          electron.shell.showItemInFolder(path.win32 ? path.win32.normalize(p) : p);
+          return;
+        }
+        const err = await electron.shell.openPath(p);
+        if (err) throw new Error(err);
+        return;
+      }
+    } catch (err) {
+      if (err instanceof Error && !err.message.includes('Cannot find module')) {
+        throw err;
+      }
+    }
+  }
 
   const command = openCommand(p, reveal);
   const opened = openStep(command);
